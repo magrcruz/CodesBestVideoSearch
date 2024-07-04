@@ -1,0 +1,135 @@
+import json
+import boto3
+from botocore.exceptions import ClientError
+import os
+
+'''
+Invokes Lambda function #4 that converts JPEG images to GIF
+Triggers SNS in the event of Label Detection Job Failure.
+Writes Labels (extracted through Rekognition) as JSON in S3 bucket.
+Creates JSON tracking file in S3 that contains a list pointing to: Input Video path, Metadata JSON path, Labels JSON path, and GIF file Path.
+'''
+
+# Invoke Lambda function: giftranscode
+def invoke_gif(bucket, key, jobID):
+    try:
+        client = boto3.client('lambda')
+        response = client.invoke(
+            FunctionName='giftranscode',
+            InvocationType='Event',
+            LogType='Tail',
+            Payload=json.dumps({"bucket": bucket, "key": key, "jobID": jobID})
+        )
+    except ClientError as e:
+        print(f"Error invoking giftranscode Lambda function: {e}")
+
+def shrinkLabels(labels):
+    outlabels = []
+    for item in labels:
+        instances = item.get("Label", {}).get("Instances", [])
+        if instances:
+            outlabels.append(item)
+    return outlabels
+
+def WriteObjectToS3AsJson(thisObject, bucket, key):
+    try:
+        client = boto3.client('s3')
+        jsonobject = json.dumps(thisObject)
+        response = client.put_object(Body=bytes(jsonobject, 'utf-8'), Bucket=bucket, Key=key)
+    except ClientError as e:
+        print(f"Error writing object to S3: {e}")
+
+def ReadFileAsJsonFromS3(bucket, key):
+    client = boto3.client('s3')
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+        jsonasRawText = response['Body'].read().decode('utf-8')
+        loadedDoc = json.loads(jsonasRawText)
+        return loadedDoc
+    except ClientError as e:
+        print(f"Error reading file from S3: {e}")
+        return []
+
+def AddUpdateProjectTracking(newObject):
+    bucket = os.environ.get("labelsbucketname")
+    key = os.environ.get("labelsoutput")
+    
+    if not bucket or not key:
+        print("Environment variables 'labelsbucketname' and 'labelsoutput' must be set.")
+        return
+    
+    currentList = ReadFileAsJsonFromS3(bucket, key)
+    videosList = []
+    newList = []
+    
+    for item in reversed(currentList):
+        if item["rawvideopath"] != newObject["rawvideopath"]:
+            if item["rawvideopath"] not in videosList:
+                newList.append(item)
+                videosList.append(item["rawvideopath"])
+                
+    newList.append(newObject)
+    WriteObjectToS3AsJson(newList, bucket, key)
+
+def SNSfailure(Message):
+    print("Label detection job failed:", Message)
+    # Handle failure (e.g., notify via SNS, log, etc.)
+
+def get_label_detection(jobid, bucket, objectname, SortBy='TIMESTAMP'):
+    try:
+        client = boto3.client('rekognition')
+        response = client.get_label_detection(
+            JobId=jobid,
+            SortBy=SortBy
+        )
+        labels = response['Labels']
+        return labels
+    except ClientError as e:
+        print(f"Error getting label detection: {e}")
+        return []
+
+def lambda_handler(event, context):
+    print(json.dumps(event))
+    
+    for record in event.get('Records', []):
+        Message = json.loads(record['Sns']['Message'])
+        print(Message)
+        
+        s3bucket = Message.get('Video', {}).get('S3Bucket')
+        jobid = Message.get('JobId')
+        status = Message.get('Status')
+        
+        if not s3bucket or not jobid or not status:
+            print("Missing necessary information in the event message.")
+            continue
+        
+        if status != 'SUCCEEDED':
+            SNSfailure(Message)
+        else:
+            s3objectname = Message['Video']['S3ObjectName']
+            labels = get_label_detection(jobid, s3bucket, s3objectname, SortBy='TIMESTAMP')
+            
+            # Write labels to S3 as JSON
+            labels_key = f"labels/{jobid}.json"
+            WriteObjectToS3AsJson(labels, s3bucket, labels_key)
+            
+            # Invoke GIF creation Lambda
+            invoke_gif(s3bucket, s3objectname, jobid)
+            
+            # Define paths
+            metadata_json_path = f"metadata/{jobid}.json"  # Assume metadata is stored here
+            gif_path = f"gifs/{jobid}.gif"  # Assume GIF is stored here
+            
+            # Create tracking object
+            newTrackObject = {
+                "rawvideopath": s3objectname,
+                "metadatajsonpath": metadata_json_path,
+                "labelsjsonpath": labels_key,
+                "giffilepath": gif_path
+            }
+            AddUpdateProjectTracking(newTrackObject)
+            
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Hello from Lambda!')
+    }

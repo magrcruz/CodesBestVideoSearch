@@ -1,0 +1,9 @@
+{
+  "Records": [
+    {
+      "Sns": {
+        "Message": "{\"Video\":{\"S3Bucket\":\"best-bideo-search\",\"S3ObjectName\":\"input/TestCat.mp4\"},\"JobId\":\"8030d5caac0f278e5853a18ea691d1a838b1cc118ba400cf9a9324816586a4df\",\"Status\":\"SUCCEEDED\"}"
+      }
+    }
+  ]
+}
